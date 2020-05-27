@@ -3,30 +3,13 @@ package sudoers
 import (
 	"bufio"
 	"os"
-	"strings"
 
 	"github.com/rs/zerolog"
 )
 
-const (
-	user = iota
-	host
-	accounts
-	commands
-)
-
 //Sudoer struct that represents permission in the suoders file
 type Sudoer struct {
-	User string
-	Host string
-	Accounts string
-	Commands string
-}
-
-//SudoerDefaults struct that represents a defaults line
-type SudoerDefaults struct {
-	Defaults string
-	DefaultsSetting string
+	Rule string
 }
 
 //Parser struct to handle parsing of sudoers file
@@ -34,7 +17,6 @@ type Parser struct {
 	zerolog.Logger
 	FileName string
 	Sudoers    []Sudoer 
-	SudoerDefaults	[]SudoerDefaults
 }
 
 //Parse func that parses a passwd file to collect users
@@ -57,14 +39,10 @@ func (p *Parser) Parse() error {
 		if len(line) <= 0 || string(line[0]) == "#" {
 			continue
 		}
-		entries := strings.Fields(line)
-		p.Logger.Debug().Msgf(" Sudoers entries are %v", entries)
+		p.Logger.Debug().Msgf(" Sudoers entries are %v", line)
 
 		p.Sudoers = append(p.Sudoers, Sudoer{
-			User: strings.TrimSpace(entries[user]),
-			Host: strings.TrimSpace(entries[host]),
-			Accounts: strings.TrimSpace(entries[accounts]),
-			Commands: strings.TrimSpace(entries[commands]),
+			Rule: line,
 		})
 	}
 	return nil

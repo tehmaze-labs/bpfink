@@ -353,6 +353,7 @@ func (ss *SudoersState) Notify(cmd string) {
 	ss.Warn().
 		Object("add", LogSudoers(add)).
 		Object("del", LogSudoers(del)).
+		Str("file", ss.sudoers).
 		Str("processName", cmd).
 		Msg("Sudoers Modified")
 }

@@ -4,7 +4,6 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/spf13/afero"
 	"github.com/bookingcom/bpfink/pkg/lang/sudoers"
-	"strings"
 )
 
 type (
@@ -71,15 +70,9 @@ func (sl *sudoersListener) sudoersParse(fileName string) error {
 	if err != nil {
 		return err
 	}
-
-	if sudoersData.Sudoers != nil {
-		for _, sudoersdata := range sudoersData.Sudoers {
-			sudoersString := []string{sudoersdata.User, sudoersdata.Host, sudoersdata.Accounts, sudoersdata.Commands}
-			sudoersCombined := strings.Join(sudoersString, " ")
-			sl.Sudoers.Rule = append(sl.Sudoers.Rule, sudoersCombined)
-		}
+	for _, sudoersdata := range sudoersData.Sudoers {
+		sl.Sudoers.Rule = append(sl.Sudoers.Rule, sudoersdata.Rule)
 	}
-
 	return nil
 }
 
