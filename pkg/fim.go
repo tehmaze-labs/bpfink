@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"strings"
 	"sync"
 	"syscall"
@@ -30,24 +31,28 @@ const (
 type (
 	// Event struct the represents event that is sent to user space from BPF
 	Event struct {
-		Mode   int32
-		PID    uint32
-		UID    uint32
-		Size   uint32
-		Inode  uint64
-		Device uint64
-		Com    string
-		Path   string
+		Mode      int32
+		PID       uint32
+		UID       uint32
+		Size      uint32
+		Inode     uint64
+		Device    uint64
+		NewInode  uint64 // target directory when renaming
+		NewDevice uint64 // target file when renaming, 0 if doesn't exist
+		Com       string
+		Path      string
 	}
 	rawEvent struct {
-		Mode   int32
-		PID    uint32
-		UID    uint32
-		Size   uint32
-		Inode  uint64
-		Device uint64
-		Com    [taskComLen]byte
-		Name   [dnameInlineLen]byte
+		Mode      int32
+		PID       uint32
+		UID       uint32
+		Size      uint32
+		Inode     uint64
+		Device    uint64
+		NewInode  uint64 // target directory when renaming
+		NewDevice uint64 // target file when renaming, 0 if doesn't exist
+		Com       [taskComLen]byte
+		Name      [dnameInlineLen]byte
 	}
 	// FIM struct that represents BPF event system
 	FIM struct {
@@ -62,15 +67,6 @@ type (
 	}
 )
 
-// NewKey takes a path to file and generates a bpf map key
-func NewKey(name string) (uint64, error) {
-	fstat := &syscall.Stat_t{}
-	if err := syscall.Stat(name, fstat); err != nil {
-		return 0, err
-	}
-	return fstat.Ino, nil
-}
-
 // Encode takes in data, and encodes it for use in BPF
 // TODO: unused in current code
 func Encode(i interface{}) ([]byte, error) {
@@ -81,6 +77,20 @@ func Encode(i interface{}) ([]byte, error) {
 
 // InitFIM function to initialize and start BPF
 func InitFIM(bccFile string, logger zerolog.Logger) (*FIM, error) {
+	// 'rules' ebpf hashmap is stored as a special file at the /sys/fs/bpf/bpfink/globals/rules
+	// it turns out it is not cleaned up between different launches of a program, so it can lead
+	// to unexpected behaviour (some rules will be still present even if they are not relevant anymore)
+	// that can lead to:
+	// 		1) ebpf map overwhelming
+	//		2) triggering non-relevant events which were relevant from previous run
+	// so let's delete that file explicitly before start-up in order to recreate it from scratch
+	rulesEBPFMapPath := path.Join(elf.BPFFSPath, "bpfink", elf.BPFDirGlobals, rulesTableName)
+	if _, err := os.Stat(rulesEBPFMapPath); err == nil {
+		if err := os.Remove(rulesEBPFMapPath); err != nil {
+			logger.Error().Err(err).Msgf("unable to delete ebpf map from previous run at %s. unexpected behavior possible", rulesEBPFMapPath)
+		}
+	}
+
 	mod := elf.NewModule(bccFile)
 
 	err := mod.Load(nil)
@@ -241,7 +251,7 @@ func (f *FIM) start() error {
 					}
 				}
 
-				if e.Mode == 4 || e.Mode == 3 {
+				if e.Mode == 4 || e.Mode == 3 || e.Mode == 0 {
 					f.Debug().Msgf("name: %v", e.Name)
 					f.Debug().Msgf("name: %v", string(e.Name[:len(e.Name)]))
 
@@ -275,7 +285,7 @@ func (f *FIM) start() error {
 					}
 				}
 				f.Events <- Event{
-					e.Mode, e.PID, e.UID, e.Size, e.Inode, e.Device,
+					e.Mode, e.PID, e.UID, e.Size, e.Inode, e.Device, e.NewInode, e.NewDevice,
 					cmdline,
 					spath,
 				}
@@ -317,20 +327,20 @@ func (f *FIM) getCMDLine(e rawEvent) string {
 
 // AddFile method to add a new file to BPF monitor
 func (f *FIM) AddFile(name string) error {
-	key, err := NewKey(name)
-	if err != nil {
+	fstat := &syscall.Stat_t{}
+	if err := syscall.Stat(name, fstat); err != nil {
 		f.Error().Err(err).Msgf("Error stating file: %v", name)
 		return err
 	}
-	f.Debug().Str("file", name).Msgf("created/updated Key : %v", key)
-	value := 1
-	pkey, pvalue := unsafe.Pointer(&key), unsafe.Pointer(&value)
+
+	f.Debug().Str("file", name).Msgf("created/updated Key : %v", fstat.Ino)
+	pkey, pvalue := unsafe.Pointer(&fstat.Ino), unsafe.Pointer(&fstat.Dev)
 	f.Debug().Str("file", name).Msg("pushing to ebpf")
 	if err := f.Module.UpdateElement(f.RulesTable, pkey, pvalue, bpfAny); err != nil {
 		return err
 	}
-	f.mapping.Store(key, name)
-	f.reverse.Store(name, key)
+	f.mapping.Store(fstat.Ino, name)
+	f.reverse.Store(name, fstat.Ino)
 	return nil
 }
 
@@ -363,20 +373,6 @@ func (f *FIM) RemoveFile(name string) error {
 	f.mapping.Delete(id)
 	f.reverse.Delete(name)
 	f.Debug().Msgf("map key: %v, with value: %v", id, name)
-	return nil
-}
-
-// AddInode method to add a new file to BPF monitor
-func (f *FIM) AddInode(key uint64, fileName string) error {
-	f.Debug().Str("file", fileName).Msgf("created/updated Key : %v", key)
-	value := 1
-	pkey, pvalue := unsafe.Pointer(&key), unsafe.Pointer(&value)
-	f.Debug().Str("file", fileName).Msg("pushing to ebpf")
-	if err := f.Module.UpdateElement(f.RulesTable, pkey, pvalue, bpfAny); err != nil {
-		return err
-	}
-	f.mapping.Store(key, fileName)
-	f.reverse.Store(fileName, key)
 	return nil
 }
 

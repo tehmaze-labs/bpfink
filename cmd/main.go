@@ -21,6 +21,8 @@ import (
 	"github.com/bookingcom/bpfink/pkg"
 )
 
+var BuildDate = "(development)" //nolint:gochecknoglobals
+
 type (
 	// Configuration Struct for bpfink config
 	Configuration struct {
@@ -46,7 +48,8 @@ type (
 			Users   struct {
 				Shadow, Passwd string
 			}
-			Generic []string
+			Generic  []string
+			Excludes []string
 		}
 	}
 	// GenericFile is the struct for watching generic file
@@ -93,22 +96,26 @@ func (c Configuration) consumers(db *pkg.AgentDB) (consumers pkg.BaseConsumers) 
 		fs = afero.NewBasePathFs(fs, c.Consumers.Root)
 	}
 	if c.Consumers.Access != "" {
-		state := &pkg.AccessState{
-			AccessListener: pkg.NewAccessListener(
-				pkg.AccessFileOpt(fs, c.Consumers.Access, c.logger()),
-			),
+		if !c.fileBelongsToExclusionList(c.Consumers.Access) {
+			state := &pkg.AccessState{
+				AccessListener: pkg.NewAccessListener(
+					pkg.AccessFileOpt(fs, c.Consumers.Access, c.logger()),
+				),
+			}
+			consumers = append(consumers, &pkg.BaseConsumer{AgentDB: db, ParserLoader: state})
 		}
-		consumers = append(consumers, &pkg.BaseConsumer{AgentDB: db, ParserLoader: state})
 	}
 	if c.Consumers.Users.Shadow != "" && c.Consumers.Users.Passwd != "" {
-		state := &pkg.UsersState{
-			UsersListener: pkg.NewUsersListener(func(l *pkg.UsersListener) {
-				l.Passwd = c.Consumers.Users.Passwd
-				l.Shadow = c.Consumers.Users.Shadow
-				l.Fs, l.Logger = fs, c.logger()
-			}),
+		if !c.fileBelongsToExclusionList(c.Consumers.Users.Shadow) || !c.fileBelongsToExclusionList(c.Consumers.Users.Passwd) {
+			state := &pkg.UsersState{
+				UsersListener: pkg.NewUsersListener(func(l *pkg.UsersListener) {
+					l.Passwd = c.Consumers.Users.Passwd
+					l.Shadow = c.Consumers.Users.Shadow
+					l.Fs, l.Logger = fs, c.logger()
+				}),
+			}
+			consumers = append(consumers, &pkg.BaseConsumer{AgentDB: db, ParserLoader: state})
 		}
-		consumers = append(consumers, &pkg.BaseConsumer{AgentDB: db, ParserLoader: state})
 	}
 	if len(c.Consumers.Sudoers) > 0 {
 		logger := c.logger()
@@ -153,20 +160,37 @@ func (c Configuration) consumers(db *pkg.AgentDB) (consumers pkg.BaseConsumers) 
 	if len(c.Consumers.Generic) > 0 {
 		genericFiles := c.genericConsumer(fs)
 		for _, genericFile := range genericFiles {
-			genericFile := genericFile
-			state := &pkg.GenericState{
-				GenericListener: pkg.NewGenericListener(func(l *pkg.GenericListener) {
-					l.File = genericFile.File
-					l.IsDir = genericFile.IsDir
-					l.Key = c.key
-					l.Fs = fs
-					l.Logger = c.logger()
-				}),
+			if !c.fileBelongsToExclusionList(genericFile.File) {
+				genericFile := genericFile
+				state := &pkg.GenericState{
+					GenericListener: pkg.NewGenericListener(func(l *pkg.GenericListener) {
+						l.File = genericFile.File
+						l.IsDir = genericFile.IsDir
+						l.Key = c.key
+						l.Fs = fs
+						l.Logger = c.logger()
+					}),
+				}
+				consumers = append(consumers, &pkg.BaseConsumer{AgentDB: db, ParserLoader: state})
 			}
-			consumers = append(consumers, &pkg.BaseConsumer{AgentDB: db, ParserLoader: state})
 		}
 	}
 	return consumers
+}
+
+/* 	Checks if file belongs to exclusion list
+true: if file needs to be excluded and hence does not create consumer
+false: otherwise
+*/
+func (c Configuration) fileBelongsToExclusionList(file string) bool {
+	logger := c.logger()
+	for _, excludeFile := range c.Consumers.Excludes {
+		if strings.HasPrefix(file, excludeFile) {
+			logger.Debug().Msgf("File belongs to exclusion list, excluding from monitoring: %v", file)
+			return true
+		}
+	}
+	return false
 }
 
 func (c Configuration) genericConsumer(fs afero.Fs) []GenericFile {
@@ -197,6 +221,9 @@ func (c Configuration) genericConsumer(fs afero.Fs) []GenericFile {
 		case mode.IsDir():
 			logger.Debug().Msg("Generic is dir")
 			err := filepath.Walk(PathFull, func(path string, info os.FileInfo, err error) error {
+				if c.checkIgnored(path, fs) {
+					return nil // skip for now
+				}
 				walkPath, resolvedInfo := c.resolvePath(path)
 				if walkPath == "" {
 					return nil // path could not be resolved skip for now
@@ -252,7 +279,7 @@ func (c Configuration) resolvePath(pathFull string) (string, os.FileInfo) {
 
 		fileInfo, err := os.Stat(linkPath)
 		if err != nil {
-			logger.Error().Err(err).Msgf("error getting file stat for readLinked file: %v", linkPath)
+			logger.Error().Err(err).Msgf("error getting file stat for readLinked file: %v, %v", linkPath, pathFull)
 			return "", nil
 		}
 		fi = fileInfo
@@ -286,6 +313,10 @@ func (c Configuration) checkIgnored(path string, fs afero.Fs) bool {
 	case accessFilePath:
 		return true
 	default:
+		// If file belongs to exclusion list, ignore it
+		if c.fileBelongsToExclusionList(path) {
+			return true
+		}
 		// Get file stat
 		fi, err := os.Stat(path)
 		if err != nil {
@@ -368,7 +399,7 @@ func (c Configuration) watcher() (*pkg.Watcher, error) {
 		}
 	}
 	return pkg.NewWatcher(func(w *pkg.Watcher) {
-		w.Logger, w.Consumers, w.FIM, w.Database, w.Key = logger, consumers.Consumers(), fim, database, c.key
+		w.Logger, w.Consumers, w.FIM, w.Database, w.Key, w.Excludes = logger, consumers.Consumers(), fim, database, c.key, c.Consumers.Excludes
 	}), nil
 }
 
@@ -453,6 +484,7 @@ func run() error {
 		return err
 	}
 
+	logger.Info().Msgf("bpfink initialized: version %s, consumers count: %d", BuildDate, len(watcher.Consumers))
 	go handleExit(watcher)
 	return watcher.Start()
 }

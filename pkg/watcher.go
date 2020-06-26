@@ -20,6 +20,7 @@ type (
 		Consumers     []Consumer
 		consumers     Consumers
 		CloseChannels chan struct{}
+		Excludes      []string
 	}
 	// Register defines register interface for a watcher
 	Register interface {
@@ -43,7 +44,7 @@ var (
 )
 
 const (
-	renameEvent = 2
+	renameEvent = 0
 	dirCreate   = 3
 	fileCreate  = 4
 	delFile     = -1
@@ -123,8 +124,16 @@ func (w *Watcher) addInode(event *Event, isdir bool) {
 		return
 	}
 	w.Debug().Msgf("File: %v found for inode", file)
-	fullPath := fmt.Sprintf("%v/%v", file, event.Path)
+	fullPath := path.Join(file, event.Path)
 	event.Path = fullPath
+
+	// Exclude file from monitoring if it belongs to exclusion list
+	for _, excludeFile := range w.Excludes {
+		if strings.HasPrefix(event.Path, excludeFile) {
+			w.Debug().Msgf("File belongs to exclusion list, excluding from monitoring: %v", event.Path)
+			return
+		}
+	}
 
 	state := &GenericState{
 		GenericListener: NewGenericListener(func(l *GenericListener) {
@@ -139,7 +148,7 @@ func (w *Watcher) addInode(event *Event, isdir bool) {
 	w.Consumers = append(w.Consumers, consumer)
 	// consumer.Init()
 	w.Debug().Msgf("fullPath: %v", event.Path)
-	switch err := w.AddInode(event.Device, event.Path); {
+	switch err := w.AddFile(event.Path); {
 	case err == nil:
 		w.consumers.Store(event.Path, consumer)
 		w.Debug().Str("file", event.Path).Msgf("start watching")
@@ -173,6 +182,7 @@ func (w *Watcher) removeInode(key uint64) {
 }
 
 // Start method to start the watcher for the given consumers
+// nolint:gocyclo // TODO: decompose this function
 func (w *Watcher) Start() error {
 	defer func() {
 		if i := recover(); i != nil {
@@ -191,6 +201,7 @@ func (w *Watcher) Start() error {
 				w.Error().Msg("error casting file string from register")
 				return false
 			}
+
 			w.Debug().Msgf("Adding File: %v", stringFile)
 			consumerValue, ok := value.(Consumer)
 			if !ok {
@@ -214,6 +225,10 @@ func (w *Watcher) Start() error {
 					event.Inode = event.Device // update so that event is processed correctly.
 				} else {
 					continue
+				}
+			case renameEvent:
+				if err := w.handleRenamingEvent(&event); err != nil {
+					w.Error().Msgf("unable to handle rename properly: %s", err)
 				}
 			}
 			w.Debug().Object("event", LogEvent(event)).Msg("event caught")
@@ -268,14 +283,6 @@ func (w *Watcher) Start() error {
 					w.Error().AnErr("error", err).Str("file", event.Path).Msg("consumer failed")
 				}
 
-				if err != ErrReload && event.Mode == renameEvent { // Rename event, reload consumer file, without consumer needed to worry about event types
-					err = w.RemoveFile(event.Path)
-					if err != nil {
-						w.Error().Err(err)
-					}
-					w.add(event.Path, consumer)
-				}
-
 				switch event.Mode {
 				case delFile:
 					w.removeInode(event.Inode)
@@ -288,6 +295,49 @@ func (w *Watcher) Start() error {
 			return nil
 		}
 	}
+}
+
+func (w *Watcher) handleRenamingEvent(event *Event) error {
+	// delete mapping and consumer of a source file if we have that
+	if sourcePath, _ := w.GetFileFromInode(event.Device); sourcePath != "" {
+		w.consumers.Delete(sourcePath)
+		w.reverse.Delete(sourcePath)
+	}
+
+	if event.NewDevice == 0 { // renaming to non-existing file
+		targetDir, err := w.GetFileFromInode(event.NewInode)
+		if err != nil {
+			w.Error().Msgf("can't find record for inode %d: %s", event.NewInode, err)
+			return err
+		}
+
+		targetPath := path.Join(targetDir, event.Path)
+
+		w.mapping.Store(event.Device, targetPath)
+		w.reverse.Store(targetPath, event.Device)
+		event.Inode = event.NewInode // let's pretend we are creating a new file
+		w.addInode(event, false)     // TODO: implicit - proper event.Path is assigned in that function
+	} else { // renaming to existing file
+		targetPath, err := w.GetFileFromInode(event.NewDevice)
+		if err != nil {
+			w.Error().Msgf("can't find record for inode %d: %s", event.NewDevice, err)
+			return err
+		}
+
+		w.mapping.Delete(event.NewDevice) // delete inode->name relation for old inode
+
+		// this function add ebpf rules for new inode but keeping consumer for old path
+		// that's exactly that we need
+		if err := w.AddFile(targetPath); err != nil {
+			w.Error().Msgf("can't update monitoring for renamed file %s", targetPath)
+		}
+		event.Path = targetPath
+	}
+
+	// TODO: future code depends on that strange assignment, need to decouple it
+	event.Inode = event.Device
+
+	return nil
 }
 
 // Stop method to clean up anc gracefully exit the watcher and BPF
